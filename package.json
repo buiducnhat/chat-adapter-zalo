@@ -1,0 +1,67 @@
+{
+  "name": "chat-adapter-zalo",
+  "version": "0.1.0",
+  "description": "Community Zalo adapter for Chat SDK - Zalo Bot Platform",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "pnpm run build"
+  },
+  "peerDependencies": {
+    "chat": ">=4.0.0",
+    "@chat-adapter/shared": ">=4.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.0",
+    "@chat-adapter/shared": "^4.23.0",
+    "@types/node": "^22.0.0",
+    "chat": "^4.23.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "@vitest/coverage-v8": "^4.1.2",
+    "vitest": "^4.1.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/buiducnhat/chat-adapter-zalo.git"
+  },
+  "homepage": "https://github.com/buiducnhat/chat-adapter-zalo#readme",
+  "bugs": {
+    "url": "https://github.com/buiducnhat/chat-adapter-zalo/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "chat",
+    "chat-sdk",
+    "zalo",
+    "bot",
+    "adapter",
+    "messaging",
+    "community"
+  ],
+  "license": "MIT",
+  "author": "Nhat Bui"
+}
