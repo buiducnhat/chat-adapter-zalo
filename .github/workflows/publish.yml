@@ -1,26 +1,48 @@
-name: Publish NPM Package
+name: Release NPM Package
 
 on:
   push:
     tags:
       - "*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (e.g., 0.1.0)"
-        required: true
-        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  create_release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+  publish:
+    needs: create_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
-        working-directory: packages/sdk
+        working-directory: .
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -28,19 +50,15 @@ jobs:
           version: latest
 
       - name: Install dependencies
-        run: pnpm install
-        working-directory: .
+        run: pnpm install --frozen-lockfile
 
-      - name: Build SDK
+      - name: Lint and format check
+        run: pnpm run check
+
+      - name: Build
         run: pnpm run build
 
-      - name: Setup Node for npm publish
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Publish to npm
-        run: npm publish --access public
+      - name: Publish package
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
