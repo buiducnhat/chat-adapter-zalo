@@ -10,7 +10,7 @@ Zalo Bot adapter for [Chat SDK](https://chat-sdk.dev), using the [Zalo Bot Platf
 ## Installation
 
 ```bash
-pnpm add chat-adapter-zalo chat @chat-adapter/shared
+pnpm add chat-adapter-zalo chat
 ```
 
 ## Usage
@@ -46,7 +46,7 @@ When using `createZaloAdapter()` without arguments, credentials are auto-detecte
 1. In the Zalo Bot dashboard, navigate to **Webhooks**
 2. Set **Webhook URL** to `https://your-domain.com/api/webhooks/zalo`
 3. Set a **Secret Token** of your choice (8–256 characters) — this becomes `ZALO_WEBHOOK_SECRET`
-4. Subscribe to the message events you need (`message.text.received`, `message.image.received`, etc.)
+4. The bot receives `message.text.received`, `message.image.received`, `message.sticker.received`, `message.voice.received` and `message.unsupported.received` events. You can also register the webhook with [`setWebhook`](https://bot.zapps.me/docs/apis/setWebhook/) and check reachability with [`testWebhook`](https://bot.zapps.me/docs/apis/testWebhook/)
 
 ### 3. Get credentials
 
@@ -96,10 +96,14 @@ Zalo delivers all events via POST requests with an `X-Bot-Api-Secret-Token` head
 | Feature        | Supported                         |
 | -------------- | --------------------------------- |
 | Post message   | Yes                               |
+| Rich text      | Yes (bold, italic, strikethrough, headings via `text_styles`) |
+| Images         | Yes (`attachments` with a `url` → `sendPhoto`) |
+| Voice          | Yes (`.aac` URL → `sendVoice`, 1-1 chats only) |
+| Stickers       | Yes (`adapter.sendSticker(chatId, stickerId)`) |
 | Edit message   | No (Zalo limitation)              |
 | Delete message | No (Zalo limitation)              |
 | Streaming      | Buffered (accumulates then sends) |
-| Auto-chunking  | Yes (splits at 2000 chars)        |
+| Auto-chunking  | Yes (splits at 2000 chars, styles re-based per chunk) |
 
 ### Conversations
 
@@ -108,7 +112,7 @@ Zalo delivers all events via POST requests with an `X-Bot-Api-Secret-Token` head
 | Reactions        | No (Zalo limitation)   |
 | Typing indicator | Yes (`sendChatAction`) |
 | DMs              | Yes                    |
-| Group chats      | Pending                |
+| Group chats      | Yes (beta on the platform; every delivered message is treated as a mention) |
 | Open DM          | Yes                    |
 
 ### Incoming message types
@@ -117,7 +121,8 @@ Zalo delivers all events via POST requests with an `X-Bot-Api-Secret-Token` head
 | ----------------- | ----------------------------- |
 | Text              | Yes                           |
 | Images            | Yes (with optional caption)   |
-| Stickers          | Yes (rendered as `[Sticker]`) |
+| Stickers          | Yes (rendered as `[Sticker]`, image as attachment) |
+| Voice             | Yes (rendered as `[Voice]`, `.aac` as audio attachment) |
 | Unsupported types | Ignored gracefully            |
 
 ### Message history
@@ -140,9 +145,13 @@ The `chatId` is the conversation ID from the Zalo webhook payload. For group cha
 ## Notes
 
 - Zalo does not expose message history APIs to bots. `fetchMessages` returns an empty array.
-- All formatting (bold, italic, code blocks) is stripped to plain text — Zalo renders no markdown.
+- Markdown is converted to plain text plus `text_styles` runs (UTF-16 offsets), so literal `*` or `_` characters never need escaping. Bold, italic and strikethrough are styled; h1–h6 render bold (h1 also large); lists and quotes keep their `-` / `1.` / `>` prefixes; links render as `label (url)`; code and tables are plain text. Strings and `{ raw }` messages are sent untouched.
+- Files cannot be uploaded: Zalo only accepts media by URL. Cards are not supported.
+- In groups the platform only delivers replies to the bot and messages mentioning it. Voice messages cannot be sent to groups (`sendVoice` is rejected up front for known groups).
+- Sending to a group requires the bot to have been added to it (see [the group guide](https://bot.zapps.me/docs/build-bot-interaction-with-group/)); `chat.id` of the webhook payload is the group ID.
+- `message.unsupported.received` is sent instead of content for protected accounts (e.g. children); these events are ignored.
 - The bot token is embedded in the API URL path and is never logged.
-- `isDM()` always returns `true` — Zalo thread IDs do not encode chat type.
+- Thread IDs do not encode the chat type, so `isDM()` is `true` unless this process has seen an inbound `GROUP` event for the chat (in-memory, bounded).
 
 ## Troubleshooting
 

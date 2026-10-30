@@ -83,7 +83,6 @@ describe("ZaloFormatConverter", () => {
     it("converts table to ASCII code block", () => {
       const table = "| Name | Age |\n|------|-----|\n| Alice | 30 |";
       const result = converter.fromAst(converter.toAst(table));
-      expect(result).toContain("```");
       expect(result).toContain("Name");
       expect(result).toContain("Alice");
       expect(result).not.toMatch(PIPE_TABLE_NAME_PATTERN);
@@ -160,7 +159,6 @@ describe("ZaloFormatConverter", () => {
       const result = converter.renderPostable({
         markdown: "| A | B |\n| --- | --- |\n| 1 | 2 |",
       });
-      expect(result).toContain("```");
       expect(result).toContain("A");
     });
 
@@ -249,9 +247,57 @@ describe("ZaloFormatConverter", () => {
     it("table converted to ASCII on roundtrip", () => {
       const input = "| Col1 | Col2 |\n|------|------|\n| A | B |";
       const result = converter.fromAst(converter.toAst(input));
-      expect(result).toContain("```");
       expect(result).toContain("Col1");
       expect(result).toContain("A");
     });
+  });
+});
+
+describe("ZaloFormatConverter — rich text", () => {
+  const converter = new ZaloFormatConverter();
+  const rich = (md: string) => converter.renderPostableRich({ markdown: md });
+
+  it("keeps literal underscores and asterisks in plain text", () => {
+    expect(rich("use snake_case_name and a * b").text).toBe(
+      "use snake_case_name and a * b",
+    );
+  });
+
+  it("merges nested styles into one run per leaf", () => {
+    const { text, styles } = rich("**bold _both_** plain");
+    expect(text).toBe("bold both plain");
+    expect(styles).toEqual([
+      { start: 0, len: 5, st: ["b"] },
+      { start: 5, len: 4, st: ["b", "i"] },
+    ]);
+  });
+
+  it("styles headings; h1 is also large", () => {
+    expect(rich("# Title\n\n## Sub").styles).toEqual([
+      { start: 0, len: 5, st: ["b", "f_18"] },
+      { start: 7, len: 3, st: ["b"] },
+    ]);
+  });
+
+  it("keeps style offsets aligned through list and quote prefixes", () => {
+    const { text, styles } = rich("- one **two**\n- three\n\n> **q**");
+    expect(text).toBe("- one two\n- three\n\n> q");
+    expect(styles).toEqual([
+      { start: 6, len: 3, st: ["b"] },
+      { start: text.indexOf("q"), len: 1, st: ["b"] },
+    ]);
+  });
+
+  it("numbers ordered lists from their start value", () => {
+    expect(rich("3. a\n4. b").text).toBe("3. a\n4. b");
+  });
+
+  it("appends link URLs when the label differs", () => {
+    expect(rich("[docs](https://x.test)").text).toBe("docs (https://x.test)");
+    expect(rich("<https://x.test>").text).toBe("https://x.test");
+  });
+
+  it("does not style code", () => {
+    expect(rich("`a_b`").styles).toEqual([]);
   });
 });

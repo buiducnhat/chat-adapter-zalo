@@ -573,38 +573,18 @@ describe("ZaloAdapter — postMessage", () => {
     expect(result.threadId).toBe("zalo:chat-123");
   });
 
-  it("sends photo via raw message without caption", async () => {
+  it("sends a sticker via sendSticker", async () => {
     const adapter = await createInitializedAdapter();
-    const photoResp = {
-      message_id: "photo-002",
-      date: 1735689602000,
-      message_type: "CHAT_PHOTO" as const,
-    };
-    mockFetch.mockResolvedValueOnce(zaloOk(photoResp));
-    await adapter.postMessage("zalo:chat-123", {
-      raw: JSON.stringify({ photo: "https://img.example.com/pic.jpg" }),
+    mockFetch.mockResolvedValueOnce(
+      zaloOk({ message_id: "st-1", date: 1735689602000 }),
+    );
+    await adapter.sendSticker("chat-123", "sticker-id");
+    const [url, init] = mockFetch.mock.calls[0] ?? [];
+    expect(String(url)).toContain("/sendSticker");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      chat_id: "chat-123",
+      sticker: "sticker-id",
     });
-    const [url] = mockFetch.mock.calls[0];
-    expect(String(url)).toContain("/sendPhoto");
-  });
-
-  it("sends photo via raw message", async () => {
-    const adapter = await createInitializedAdapter();
-    const photoResp = {
-      message_id: "photo-001",
-      date: 1735689602000,
-      message_type: "CHAT_PHOTO" as const,
-    };
-    mockFetch.mockResolvedValueOnce(zaloOk(photoResp));
-    const result = await adapter.postMessage("zalo:chat-123", {
-      raw: JSON.stringify({
-        photo: "https://img.example.com/pic.jpg",
-        caption: "Nice",
-      }),
-    });
-    const [url] = mockFetch.mock.calls[0];
-    expect(String(url)).toContain("/sendPhoto");
-    expect(result.id).toBe("photo-001");
   });
 
   it("throws AdapterError for card messages", async () => {
@@ -663,18 +643,163 @@ describe("ZaloAdapter — postMessage", () => {
   });
 
   it("raw.message.from.id is empty string for photo when not initialized", async () => {
-    // Covers `this._botUserId ?? ""` branch in sendPhoto response (line 316)
     const adapter = createAdapter();
-    const photoResp = {
-      message_id: "photo-uninit",
-      date: 1735689602000,
-      message_type: "CHAT_PHOTO" as const,
-    };
-    mockFetch.mockResolvedValueOnce(zaloOk(photoResp));
+    mockFetch.mockResolvedValueOnce(
+      zaloOk({ message_id: "photo-uninit", date: 1735689602000 }),
+    );
     const result = await adapter.postMessage("zalo:chat-123", {
-      raw: JSON.stringify({ photo: "https://img.example.com/pic.jpg" }),
+      markdown: "",
+      attachments: [{ type: "image", url: "https://img.example.com/pic.jpg" }],
     });
     expect(result.raw.message.from.id).toBe("");
+  });
+
+  it("sends bold/italic/strike as text_styles with UTF-16 offsets", async () => {
+    const adapter = await createInitializedAdapter();
+    mockFetch.mockResolvedValueOnce(zaloOk(sendResponse));
+    await adapter.postMessage("zalo:chat-123", {
+      markdown: "😀 **bold** and ~~gone~~ snake_case_name",
+    });
+    const body = JSON.parse(mockFetch.mock.calls[0]?.[1]?.body as string);
+    expect(body.text).toBe("😀 bold and gone snake_case_name");
+    expect(body.text_styles).toEqual([
+      { start: 3, len: 4, st: ["b"] },
+      { start: 12, len: 4, st: ["s"] },
+    ]);
+    expect(body.parse_mode).toBeUndefined();
+  });
+
+  it("omits text_styles for plain strings and raw text", async () => {
+    const adapter = await createInitializedAdapter();
+    mockFetch
+      .mockResolvedValueOnce(zaloOk(sendResponse))
+      .mockResolvedValueOnce(zaloOk(sendResponse));
+    await adapter.postMessage("zalo:chat-123", "**not bold**");
+    await adapter.postMessage("zalo:chat-123", { raw: "*raw*" });
+    for (const call of mockFetch.mock.calls) {
+      const body = JSON.parse(call[1]?.body as string);
+      expect(body.text_styles).toBeUndefined();
+    }
+  });
+
+  it("re-bases text_styles per chunk when splitting long messages", async () => {
+    const adapter = await createInitializedAdapter();
+    mockFetch
+      .mockResolvedValueOnce(zaloOk(sendResponse))
+      .mockResolvedValueOnce(zaloOk(sendResponse));
+    await adapter.postMessage("zalo:chat-123", {
+      markdown: `${"A".repeat(1200)}\n\n${"B".repeat(900)}\n\n**tail**`,
+    });
+    const second = JSON.parse(mockFetch.mock.calls[1]?.[1]?.body as string);
+    expect(second.text).toBe(`${"B".repeat(900)}\n\ntail`);
+    expect(second.text_styles).toEqual([{ start: 902, len: 4, st: ["b"] }]);
+  });
+
+  it("sends an image attachment with unformatted text as photo caption", async () => {
+    const adapter = await createInitializedAdapter();
+    mockFetch.mockResolvedValueOnce(
+      zaloOk({ message_id: "photo-001", date: 1735689602000 }),
+    );
+    const result = await adapter.postMessage("zalo:chat-123", {
+      markdown: "Nice",
+      attachments: [{ type: "image", url: "https://img.example.com/pic.jpg" }],
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0] ?? [];
+    expect(String(url)).toContain("/sendPhoto");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      chat_id: "chat-123",
+      photo: "https://img.example.com/pic.jpg",
+      caption: "Nice",
+    });
+    expect(result.id).toBe("photo-001");
+  });
+
+  it("sends formatted text separately from the photo", async () => {
+    const adapter = await createInitializedAdapter();
+    mockFetch
+      .mockResolvedValueOnce(
+        zaloOk({ message_id: "photo-1", date: 1735689602000 }),
+      )
+      .mockResolvedValueOnce(zaloOk(sendResponse));
+    await adapter.postMessage("zalo:chat-123", {
+      markdown: "**Nice**",
+      attachments: [{ type: "image", url: "https://img.example.com/pic.jpg" }],
+    });
+    expect(String(mockFetch.mock.calls[0]?.[0])).toContain("/sendPhoto");
+    expect(String(mockFetch.mock.calls[1]?.[0])).toContain("/sendMessage");
+  });
+
+  it("sends an audio attachment via sendVoice", async () => {
+    const adapter = await createInitializedAdapter();
+    mockFetch.mockResolvedValueOnce(
+      zaloOk({ message_id: "voice-1", date: 1735689602000 }),
+    );
+    const result = await adapter.postMessage("zalo:chat-123", {
+      markdown: "",
+      attachments: [{ type: "audio", url: "https://cdn.example.com/a.aac" }],
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0] ?? [];
+    expect(String(url)).toContain("/sendVoice");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      chat_id: "chat-123",
+      voice_url: "https://cdn.example.com/a.aac",
+    });
+    expect(result.raw.message.voice_url).toBe("https://cdn.example.com/a.aac");
+  });
+
+  it("treats group chats as non-DM, mentions, and rejects voice to them", async () => {
+    const adapter = createAdapter();
+    const chat = createMockChat();
+    mockFetch.mockResolvedValueOnce(zaloOk(getMeResponse));
+    await adapter.initialize(chat);
+    mockFetch.mockReset();
+
+    expect(adapter.isDM("zalo:group-1")).toBe(true);
+    await adapter.handleWebhook(
+      new Request("https://example.com/webhook", {
+        method: "POST",
+        headers: { "x-bot-api-secret-token": "super-secret" },
+        body: JSON.stringify({
+          event_name: "message.text.received",
+          message: sampleInboundMessage({
+            chat: { id: "group-1", chat_type: "GROUP" },
+          }),
+        }),
+      }),
+    );
+
+    const dispatched = vi.mocked(chat.processMessage).mock.calls[0]?.[2] as {
+      isMention?: boolean;
+    };
+    expect(dispatched.isMention).toBe(true);
+    expect(adapter.isDM("zalo:group-1")).toBe(false);
+    expect(adapter.isDM("zalo:chat-123")).toBe(true);
+
+    await expect(
+      adapter.postMessage("zalo:group-1", {
+        markdown: "",
+        attachments: [{ type: "audio", url: "https://cdn.example.com/a.aac" }],
+      }),
+    ).rejects.toThrow(ValidationError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects file uploads and non-url attachments", async () => {
+    const adapter = await createInitializedAdapter();
+    await expect(
+      adapter.postMessage("zalo:chat-123", {
+        markdown: "x",
+        files: [{ filename: "a.txt", data: Buffer.from("a") }],
+      }),
+    ).rejects.toThrow(ValidationError);
+    await expect(
+      adapter.postMessage("zalo:chat-123", {
+        markdown: "x",
+        attachments: [{ type: "file", url: "https://x.test/a.pdf" }],
+      }),
+    ).rejects.toThrow(ValidationError);
   });
 });
 
@@ -966,5 +1091,69 @@ describe("splitMessage", () => {
     const text = [para, para, para].join("\n\n");
     const chunks = splitMessage(text);
     expect(chunks).toHaveLength(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inbound voice / sticker / photo_url
+// ---------------------------------------------------------------------------
+
+describe("ZaloAdapter — inbound media", () => {
+  it("parses voice messages as audio attachments", async () => {
+    const adapter = await createInitializedAdapter();
+    const msg = adapter.parseMessage({
+      message: sampleInboundMessage({
+        text: undefined,
+        message_type: "CHAT_VOICE",
+        voice_url: "https://cdn.example.com/v.aac",
+      }),
+    });
+    expect(msg.text).toBe("[Voice]");
+    expect(msg.attachments[0]).toMatchObject({
+      type: "audio",
+      url: "https://cdn.example.com/v.aac",
+    });
+  });
+
+  it("reads photo_url and exposes the sticker image url", async () => {
+    const adapter = await createInitializedAdapter();
+    const photo = adapter.parseMessage({
+      message: sampleInboundMessage({
+        text: undefined,
+        photo_url: "https://img.example.com/p.jpg",
+      }),
+    });
+    expect(photo.attachments[0]?.url).toBe("https://img.example.com/p.jpg");
+    const sticker = adapter.parseMessage({
+      message: sampleInboundMessage({
+        text: undefined,
+        sticker: "sid",
+        url: "https://img.example.com/s.png",
+      }),
+    });
+    expect(sticker.text).toBe("[Sticker]");
+    expect(sticker.attachments[0]?.url).toBe("https://img.example.com/s.png");
+  });
+
+  it("dispatches voice events", async () => {
+    const adapter = createAdapter();
+    const chat = createMockChat();
+    mockFetch.mockResolvedValueOnce(zaloOk(getMeResponse));
+    await adapter.initialize(chat);
+    const res = await adapter.handleWebhook(
+      new Request("https://example.com/webhook", {
+        method: "POST",
+        headers: { "x-bot-api-secret-token": "super-secret" },
+        body: JSON.stringify({
+          event_name: "message.voice.received",
+          message: sampleInboundMessage({
+            text: undefined,
+            voice_url: "https://cdn.example.com/v.aac",
+          }),
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(chat.processMessage).toHaveBeenCalledOnce();
   });
 });

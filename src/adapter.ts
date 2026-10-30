@@ -3,6 +3,8 @@ import {
   AdapterError,
   AdapterRateLimitError,
   extractCard,
+  extractFiles,
+  extractPostableAttachments,
   ValidationError,
 } from "@chat-adapter/shared";
 import type {
@@ -23,14 +25,16 @@ import type {
   WebhookOptions,
 } from "chat";
 import { Message } from "chat";
-import { ZaloFormatConverter } from "./format-converter";
+import { ZaloFormatConverter, type ZaloRichText } from "./format-converter";
 import type {
   ZaloAdapterConfig,
   ZaloApiResponse,
+  ZaloChatType,
   ZaloGetMeResponse,
   ZaloInboundMessage,
   ZaloRawMessage,
   ZaloSendResponse,
+  ZaloTextStyle,
   ZaloThreadId,
   ZaloWebhookResult,
 } from "./types";
@@ -38,21 +42,27 @@ import type {
 /** Maximum message length for Zalo Bot API */
 const ZALO_MESSAGE_LIMIT = 2000;
 
+const WHITESPACE = /\s/;
+
+/** Maximum number of group chat IDs remembered for `isDM` lookups */
+const GROUP_CACHE_LIMIT = 1000;
+
 /**
- * Split text into chunks that fit within Zalo's 2000-character message limit,
- * breaking on paragraph boundaries when possible, then line boundaries,
- * and finally at the character limit as a last resort.
+ * Compute `[start, end)` ranges that fit within Zalo's 2000-character message
+ * limit, breaking on paragraph boundaries when possible, then line
+ * boundaries, and finally at the character limit as a last resort. Whitespace
+ * around each break is excluded from the ranges.
  */
-export function splitMessage(text: string): string[] {
+function splitRanges(text: string): Array<[number, number]> {
   if (text.length <= ZALO_MESSAGE_LIMIT) {
-    return [text];
+    return [[0, text.length]];
   }
 
-  const chunks: string[] = [];
-  let remaining = text;
+  const ranges: Array<[number, number]> = [];
+  let pos = 0;
 
-  while (remaining.length > ZALO_MESSAGE_LIMIT) {
-    const slice = remaining.slice(0, ZALO_MESSAGE_LIMIT);
+  while (text.length - pos > ZALO_MESSAGE_LIMIT) {
+    const slice = text.slice(pos, pos + ZALO_MESSAGE_LIMIT);
 
     // Try to break at a paragraph boundary
     let breakIndex = slice.lastIndexOf("\n\n");
@@ -65,15 +75,47 @@ export function splitMessage(text: string): string[] {
       breakIndex = ZALO_MESSAGE_LIMIT;
     }
 
-    chunks.push(remaining.slice(0, breakIndex).trimEnd());
-    remaining = remaining.slice(breakIndex).trimStart();
+    let end = pos + breakIndex;
+    while (end > pos && WHITESPACE.test(text[end - 1] as string)) {
+      end--;
+    }
+    ranges.push([pos, end]);
+
+    pos += breakIndex;
+    while (pos < text.length && WHITESPACE.test(text[pos] as string)) {
+      pos++;
+    }
   }
 
-  if (remaining.length > 0) {
-    chunks.push(remaining);
+  if (pos < text.length) {
+    ranges.push([pos, text.length]);
   }
 
-  return chunks;
+  return ranges;
+}
+
+/**
+ * Split text into chunks that fit within Zalo's 2000-character message limit.
+ */
+export function splitMessage(text: string): string[] {
+  return splitRanges(text).map(([start, end]) => text.slice(start, end));
+}
+
+/**
+ * Split rich text into chunks, clipping and re-basing style runs per chunk.
+ */
+function splitRichText(rich: ZaloRichText): ZaloRichText[] {
+  return splitRanges(rich.text).map(([start, end]) => {
+    const styles: ZaloTextStyle[] = [];
+    for (const run of rich.styles) {
+      const from = Math.max(run.start, start);
+      const to = Math.min(run.start + run.len, end);
+      if (to > from) {
+        styles.push({ start: from - start, len: to - from, st: run.st });
+      }
+    }
+    return { text: rich.text.slice(start, end), styles };
+  });
 }
 
 /**
@@ -100,13 +142,14 @@ export function splitMessage(text: string): string[] {
 export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
   readonly name = "zalo";
   readonly lockScope = "channel" as const;
-  readonly persistMessageHistory = true;
+  readonly persistThreadHistory = true;
   readonly userName: string;
 
   private readonly botToken: string;
   private readonly webhookSecret: string;
-  private readonly logger: Logger;
+  private logger: Logger;
   private readonly formatConverter = new ZaloFormatConverter();
+  private readonly groupChats = new Set<string>();
   private chat: ChatInstance | null = null;
   private _botUserId: string | null = null;
 
@@ -127,6 +170,7 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
    */
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
+    this.logger = chat.getLogger("zalo");
 
     const me = await this.apiRequest<ZaloGetMeResponse>("getMe");
     this._botUserId = me.id;
@@ -181,11 +225,14 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
       case "message.text.received":
       case "message.image.received":
       case "message.sticker.received":
-        this.handleInboundMessage(message, options);
+      case "message.voice.received":
+        if (message) {
+          this.handleInboundMessage(message, options);
+        }
         break;
       case "message.unsupported.received":
         this.logger.debug("Zalo webhook: unsupported message type, ignoring", {
-          messageId: message.message_id,
+          messageId: message?.message_id,
         });
         break;
       default:
@@ -199,6 +246,9 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
 
   /**
    * Handle an inbound message from a user.
+   *
+   * In GROUP chats the platform only delivers replies to the bot and
+   * messages that mention it, so every group message counts as a mention.
    */
   private handleInboundMessage(
     inbound: ZaloInboundMessage,
@@ -209,10 +259,34 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
       return;
     }
 
+    this.rememberChatType(inbound.chat.id, inbound.chat.chat_type);
+
     const threadId = this.encodeThreadId({ chatId: inbound.chat.id });
     const raw: ZaloRawMessage = { message: inbound };
     const message = this.parseMessage(raw);
+    if (inbound.chat.chat_type === "GROUP") {
+      message.isMention = true;
+    }
     this.chat.processMessage(this, threadId, message, options);
+  }
+
+  /**
+   * Remember which chats are groups. Thread IDs don't encode the chat type,
+   * so `isDM` relies on this (bounded, in-memory) record from inbound events.
+   */
+  private rememberChatType(chatId: string, chatType: ZaloChatType): void {
+    if (chatType !== "GROUP") {
+      this.groupChats.delete(chatId);
+      return;
+    }
+    this.groupChats.delete(chatId);
+    if (this.groupChats.size >= GROUP_CACHE_LIMIT) {
+      const oldest = this.groupChats.values().next().value;
+      if (oldest !== undefined) {
+        this.groupChats.delete(oldest);
+      }
+    }
+    this.groupChats.add(chatId);
   }
 
   /**
@@ -243,13 +317,25 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
     let text: string;
     const attachments: Attachment[] = [];
 
+    const photoUrl = message.photo_url ?? message.photo;
+
     if (message.text) {
       text = message.text;
-    } else if (message.photo) {
+    } else if (photoUrl) {
       text = message.caption ?? "[Image]";
-      attachments.push({ type: "image", url: message.photo });
+      attachments.push({ type: "image", url: photoUrl });
+    } else if (message.voice_url) {
+      text = "[Voice]";
+      attachments.push({
+        type: "audio",
+        url: message.voice_url,
+        mimeType: "audio/aac",
+      });
     } else if (message.sticker) {
       text = "[Sticker]";
+      if (message.url) {
+        attachments.push({ type: "image", url: message.url });
+      }
     } else {
       text = "[Unsupported message]";
     }
@@ -282,6 +368,12 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
 
   /**
    * Send a message to a Zalo chat.
+   *
+   * Image attachments (by URL) are sent with `sendPhoto`, audio attachments
+   * (by `.aac` URL, 1-1 chats only) with `sendVoice`. Text is sent with
+   * `sendMessage` and carries bold/italic/strikethrough/heading formatting via
+   * `text_styles`. When a single image is posted with unformatted text that
+   * fits the limit, the text becomes the photo caption.
    */
   async postMessage(
     threadId: string,
@@ -289,79 +381,75 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
   ): Promise<RawMessage<ZaloRawMessage>> {
     const { chatId } = this.decodeThreadId(threadId);
 
-    // Check for photo message
-    if (typeof message === "object" && "raw" in message) {
-      try {
-        const rawMessage = JSON.parse(message.raw) as {
-          photo: string;
-          caption?: string;
-        };
-
-        const response = await this.sendPhoto(
-          chatId,
-          rawMessage.photo,
-          rawMessage.caption,
-        );
-        return {
-          id: response.message_id,
-          threadId,
-          raw: {
-            message: {
-              message_id: response.message_id,
-              date: response.date,
-              chat: { id: chatId, chat_type: "PRIVATE" },
-              from: {
-                id: this._botUserId ?? "",
-                display_name: this.userName,
-                is_bot: true,
-              },
-              photo: rawMessage.photo,
-              caption: rawMessage.caption,
-            },
-          },
-        };
-      } catch (_error) {
-        // If parsing fails, throw an error about unsupported message format
-        throw new AdapterError(
-          "Zalo adapter does not support this message type. Please convert your card to text or image before sending.",
-          "zalo",
-        );
-      }
-    }
-
-    const card = extractCard(message);
-    if (card) {
-      // Zalo doesn't support rich cards, throw an error if the message contains unsupported content
+    if (extractCard(message)) {
+      // Zalo doesn't support rich cards
       throw new AdapterError(
         "Zalo adapter does not support card messages. Please convert your card to text or image before sending.",
         "zalo",
       );
     }
 
-    const body = this.formatConverter.renderPostable(message);
-    return this.sendTextMessage(threadId, chatId, body);
+    if (extractFiles(message).length > 0) {
+      throw new ValidationError(
+        "zalo",
+        "Zalo does not support file uploads. Attach media by URL instead.",
+      );
+    }
+
+    const attachments = extractPostableAttachments(message);
+    for (const attachment of attachments) {
+      if (!attachment.url || !["image", "audio"].includes(attachment.type)) {
+        throw new ValidationError(
+          "zalo",
+          "Zalo only supports image and audio attachments referenced by url.",
+        );
+      }
+    }
+    const images = attachments.filter((a) => a.type === "image");
+    const voices = attachments.filter((a) => a.type === "audio");
+
+    const rich = this.formatConverter.renderPostableRich(message);
+    const captionable =
+      images.length === 1 &&
+      rich.styles.length === 0 &&
+      rich.text.length > 0 &&
+      rich.text.length <= ZALO_MESSAGE_LIMIT;
+
+    let result: RawMessage<ZaloRawMessage> | undefined;
+
+    for (const image of images) {
+      const caption = captionable ? rich.text : undefined;
+      const photo = image.url as string;
+      const response = await this.sendPhoto(chatId, photo, caption);
+      result = this.buildRawMessage(threadId, chatId, response, {
+        photo_url: photo,
+        caption,
+      });
+    }
+
+    for (const voice of voices) {
+      const voiceUrl = voice.url as string;
+      const response = await this.sendVoice(chatId, voiceUrl);
+      result = this.buildRawMessage(threadId, chatId, response, {
+        voice_url: voiceUrl,
+      });
+    }
+
+    if (captionable || (rich.text.length === 0 && result)) {
+      return result as RawMessage<ZaloRawMessage>;
+    }
+    return this.sendTextMessage(threadId, chatId, rich);
   }
 
   /**
-   * Split text into chunks at the 2000-character limit.
+   * Build the RawMessage describing a message this bot just sent.
    */
-  splitMessage(text: string): string[] {
-    return splitMessage(text);
-  }
-
-  /**
-   * Send a single text message (must be within 2000-char limit).
-   */
-  private async sendSingleTextMessage(
+  private buildRawMessage(
     threadId: string,
     chatId: string,
-    text: string,
-  ): Promise<RawMessage<ZaloRawMessage>> {
-    const response = await this.apiRequest<ZaloSendResponse>("sendMessage", {
-      chat_id: chatId,
-      text,
-    });
-
+    response: ZaloSendResponse,
+    content: Partial<ZaloInboundMessage>,
+  ): RawMessage<ZaloRawMessage> {
     return {
       id: response.message_id,
       threadId,
@@ -369,13 +457,16 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
         message: {
           message_id: response.message_id,
           date: response.date,
-          chat: { id: chatId, chat_type: "PRIVATE" },
+          chat: {
+            id: chatId,
+            chat_type: this.groupChats.has(chatId) ? "GROUP" : "PRIVATE",
+          },
           from: {
             id: this._botUserId ?? "",
             display_name: this.userName,
             is_bot: true,
           },
-          text,
+          ...content,
         },
       },
     };
@@ -388,20 +479,26 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
   private async sendTextMessage(
     threadId: string,
     chatId: string,
-    text: string,
+    rich: ZaloRichText,
   ): Promise<RawMessage<ZaloRawMessage>> {
-    const chunks = this.splitMessage(text);
     let result: RawMessage<ZaloRawMessage> | undefined;
 
-    for (const chunk of chunks) {
-      result = await this.sendSingleTextMessage(threadId, chatId, chunk);
+    for (const chunk of splitRichText(rich)) {
+      const response = await this.apiRequest<ZaloSendResponse>("sendMessage", {
+        chat_id: chatId,
+        text: chunk.text,
+        ...(chunk.styles.length > 0 ? { text_styles: chunk.styles } : {}),
+      });
+      result = this.buildRawMessage(threadId, chatId, response, {
+        text: chunk.text,
+      });
     }
 
     return result as RawMessage<ZaloRawMessage>;
   }
 
   /**
-   * Send a photo to a Zalo chat.
+   * Send a photo (by URL) to a Zalo chat.
    */
   async sendPhoto(
     chatId: string,
@@ -412,6 +509,37 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
       chat_id: chatId,
       photo: photoUrl,
       ...(caption ? { caption } : {}),
+    });
+  }
+
+  /**
+   * Send a sticker (ID from https://stickers.zaloapp.com/) to a Zalo chat.
+   */
+  async sendSticker(
+    chatId: string,
+    sticker: string,
+  ): Promise<ZaloSendResponse> {
+    return this.apiRequest<ZaloSendResponse>("sendSticker", {
+      chat_id: chatId,
+      sticker,
+    });
+  }
+
+  /**
+   * Send a voice message (`.aac` file URL, no caption). 1-1 chats only: the
+   * API may report success for a group chat ID without delivering anything,
+   * so known group chats are rejected up front.
+   */
+  async sendVoice(chatId: string, voiceUrl: string): Promise<ZaloSendResponse> {
+    if (this.groupChats.has(chatId)) {
+      throw new ValidationError(
+        "zalo",
+        "Zalo sendVoice does not support group chats.",
+      );
+    }
+    return this.apiRequest<ZaloSendResponse>("sendVoice", {
+      chat_id: chatId,
+      voice_url: voiceUrl,
     });
   }
 
@@ -514,7 +642,7 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
       id: threadId,
       channelId: threadId,
       channelName: `Zalo: ${chatId}`,
-      isDM: true,
+      isDM: !this.groupChats.has(chatId),
       metadata: { chatId },
     };
   }
@@ -558,11 +686,12 @@ export class ZaloAdapter implements Adapter<ZaloThreadId, ZaloRawMessage> {
   }
 
   /**
-   * Zalo conversations default to DM (PRIVATE).
-   * We don't store chat_type in the thread ID.
+   * Conversations are DMs unless an inbound event marked the chat as a GROUP.
+   * Thread IDs don't encode the chat type, so this is only known for chats
+   * seen by this process.
    */
-  isDM(_threadId: string): boolean {
-    return true;
+  isDM(threadId: string): boolean {
+    return !this.groupChats.has(this.decodeThreadId(threadId).chatId);
   }
 
   /**
